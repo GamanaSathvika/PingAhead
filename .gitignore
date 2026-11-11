@@ -4,3 +4,4 @@ __pycache__/
 data/raw/
 models/*.pkl
 .ipynb_checkpoints/
+data/processed/01_cleaned/
