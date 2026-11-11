@@ -58,8 +58,8 @@ def clean_and_prepare(input_file, output_file):
     print(f"  -> Saved {os.path.basename(output_file)} | Shape: {df.shape}")
 
 if __name__ == "__main__":
-    input_dir = "data/raw/scenarios-10-sec"
-    output_dir = "data/processed/01_cleaned"
+    input_dir = "data/raw/scenarios-5-sec"
+    output_dir = "data/processed/01_cleaned/5s"
     
     scenario_files = sorted(glob.glob(os.path.join(input_dir, "*.csv")))
     

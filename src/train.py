@@ -1,28 +1,6 @@
 """
-train.py  -  attack-onset forecasting (attack_in_next_60s) on windowed Argus flows.
-
-What this script does
----------------------
-1. Builds episode masks per scenario:
-     in_episode    : windows inside an attack episode (attack runs <= MAX_GAP apart are merged)
-     post_episode  : the POST_WINDOWS windows after an episode (lag/rolling features still
-                     contain attack traffic, so they are not "quiet" traffic)
-     tail_row      : last HORIZON windows of a file (look-ahead label is incomplete)
-     quiet         : the rows used for training AND evaluation (see build_masks)
-2. Leave-one-scenario-out (LOSO) evaluation with a NESTED threshold:
-     for each held-out scenario, the alert threshold is chosen using only the other
-     scenarios (inner LOSO), then applied once to the held-out scenario.
-   So FA/hr, episode recall and lead time are genuinely held-out numbers.
-3. Reports episode recall (overall + per phase + Wilson 95% CI), lead time, and false
-   alarms as ALERT EVENTS per hour (consecutive alert windows = 1 event) and per window.
-4. Optional feature ablation (--ablate) to test dependence on response-ratio / volume features.
-5. Trains the dashboard demo model (hold out scenario-5 and scenario-8 by default), picks
-   its threshold from inner LOSO on the training scenarios only, and writes simulation CSVs.
-
-Usage
------
-    python3 src/train.py                 # nested LOSO + demo export
-    python3 src/train.py --ablate        # additionally run the feature ablation
+train.py  -  attack-onset forecasting on multi-resolution windowed Argus flows (5s, 10s, 30s, 60s).
+Time-anchored to a fixed 60-second forecast horizon across all resolutions.
 """
 import argparse
 import json
@@ -34,15 +12,15 @@ import pandas as pd
 from sklearn.metrics import average_precision_score, roc_auc_score
 from xgboost import XGBClassifier
 
-WINDOW_SEC = 10
-HORIZON = 6          # forecast horizon in windows (60 s)
-MAX_GAP = 6          # attack runs separated by <= this many benign windows are one episode
-POST_WINDOWS = 6     # windows after an episode whose lag/rolling features are contaminated
+# Fixed time parameters (in seconds)
+TARGET_LEAD_SEC = 60
+MAX_GAP_SEC = 60
+POST_SEC = 60
+
 TARGET = "attack_in_next_60s"
-BASELINE_COL = "no_resp_ratio_roll6_mean"   # simple rule baseline score
+BASELINE_COL = "no_resp_ratio_roll_mean"   # simple rule baseline score (60 s rolling mean; see windows.py)
 PHASE_LABELS = {0: "phase 1", 1: "phase 2", 2: "phase 3"}
 
-# Never features: identifiers, labels, and anything computed from labels.
 FORBIDDEN_COLS = ["attack_flow_ratio"]
 META_AND_LABEL_COLS = [
     "StartTime", "scenario", "is_attack", "stage_id", TARGET,
@@ -50,7 +28,6 @@ META_AND_LABEL_COLS = [
     "post_episode", "tail_row", "quiet",
 ] + FORBIDDEN_COLS
 
-# Ablation groups (prefix match on feature names).
 RESPONSE_PREFIXES = ("no_resp", "state_", "DstPkts", "DstBytes", "src_bytes_ratio",
                      "dMeanPktSz", "PCRatio", "TcpRtt", "SynAck", "Loss")
 SCALE_PREFIXES = ("TotBytes", "TotPkts", "SrcBytes", "DstBytes", "SrcPkts", "DstPkts",
@@ -58,10 +35,9 @@ SCALE_PREFIXES = ("TotBytes", "TotPkts", "SrcBytes", "DstBytes", "SrcPkts", "Dst
 
 
 # --------------------------------------------------------------------------------------
-# Masks
+# Masks (now accepts dynamic resolution parameters)
 # --------------------------------------------------------------------------------------
-def build_masks(df, max_gap=MAX_GAP, horizon=HORIZON, post=POST_WINDOWS):
-    """df must be sorted by (scenario, StartTime) with a clean RangeIndex."""
+def build_masks(df, horizon, max_gap, post):
     df = df.copy()
     n = len(df)
     in_ep = np.zeros(n, int)
@@ -90,7 +66,7 @@ def build_masks(df, max_gap=MAX_GAP, horizon=HORIZON, post=POST_WINDOWS):
             phase[idx[a:b + 1]] = k
             spans.append((a, b, next_ep))
             next_ep += 1
-        for a, b, e in spans:                       # in_ep is complete for this scenario now
+        for a, b, e in spans:
             for p in range(max(0, a - horizon), a):
                 if in_ep[idx[p]] == 0:
                     pre[idx[p]] = 1
@@ -106,8 +82,6 @@ def build_masks(df, max_gap=MAX_GAP, horizon=HORIZON, post=POST_WINDOWS):
     df["pre_for_episode"] = pre_for
     df["post_episode"] = post_m
     df["tail_row"] = tail
-    # quiet = outside episodes, not in the contaminated post-episode zone (unless it is a genuine
-    # pre-onset positive), and with a complete look-ahead label.
     df["quiet"] = ((in_ep == 0) & (tail == 0) &
                    ((post_m == 0) | (df[TARGET].to_numpy() == 1))).astype(int)
     return df
@@ -116,10 +90,7 @@ def build_masks(df, max_gap=MAX_GAP, horizon=HORIZON, post=POST_WINDOWS):
 # --------------------------------------------------------------------------------------
 # Alerts, thresholds, metrics
 # --------------------------------------------------------------------------------------
-def count_alerts(scores, quiet, y, scen, thr):
-    """Merge consecutive alert windows (within a scenario, on quiet rows) into alert EVENTS.
-    Returns (false_events, true_events, false_alert_windows). A true event contains >= 1
-    genuine pre-onset window (y == 1)."""
+def count_alerts(scores, quiet, y, scen, thr, window_sec):
     alert = (scores >= thr) & (quiet == 1)
     if not alert.any():
         return 0, 0, 0
@@ -133,16 +104,14 @@ def count_alerts(scores, quiet, y, scen, thr):
     return n_runs - true_runs, true_runs, false_windows
 
 
-def choose_threshold(scores, quiet, y, scen, target_events_per_hr):
-    """Lowest threshold whose false alert EVENTS/hr stays <= target on the given rows.
-    Scans downward from the strictest threshold and stops at the first violation."""
+def choose_threshold(scores, quiet, y, scen, target_events_per_hr, window_sec):
     quiet = quiet.astype(int)
-    hours = quiet.sum() * WINDOW_SEC / 3600.0
+    hours = quiet.sum() * window_sec / 3600.0
     neg = scores[(quiet == 1) & (y == 0)]
     cand = np.unique(np.quantile(neg, 1 - np.logspace(-4, -0.3, 150)))[::-1]
     chosen = None
     for t in cand:
-        fe, _, _ = count_alerts(scores, quiet, y, scen, t)
+        fe, _, _ = count_alerts(scores, quiet, y, scen, t, window_sec)
         if fe / hours <= target_events_per_hr:
             chosen = t
         else:
@@ -152,11 +121,10 @@ def choose_threshold(scores, quiet, y, scen, target_events_per_hr):
     return float(chosen)
 
 
-def evaluate_scenario(g, scores, thr):
-    """Episode-level evaluation of one scenario at a fixed threshold."""
+def evaluate_scenario(g, scores, thr, window_sec, horizon):
     quiet = g["quiet"].to_numpy()
     y = g[TARGET].to_numpy()
-    fe, te, fw = count_alerts(scores, quiet, y, g["scenario"].to_numpy(), thr)
+    fe, te, fw = count_alerts(scores, quiet, y, g["scenario"].to_numpy(), thr, window_sec)
     ep_col = g["episode_id"].to_numpy()
     pre_for = g["pre_for_episode"].to_numpy()
     phase = g["phase"].to_numpy()
@@ -168,10 +136,12 @@ def evaluate_scenario(g, scores, thr):
         eps.append(dict(
             scenario=scen, episode_id=int(e), phase=int(phase[onset]),
             detected=int(len(hit) > 0),
-            lead_sec=float((onset - hit[0]) * WINDOW_SEC) if len(hit) else np.nan,
+            # features of a window are only complete when it ends, so lead = gap to onset minus one
+            # window. Onset is the START of the first attack window, so this is a lower bound.
+            lead_sec=float((onset - hit[0]) * window_sec - window_sec) if len(hit) else np.nan,
             threshold=thr))
-    stats = dict(false_events=fe, true_events=te, false_windows=fw,
-                 hours=quiet.sum() * WINDOW_SEC / 3600.0)
+    stats = dict(scenario=scen, false_events=fe, true_events=te, false_windows=fw,
+                 hours=quiet.sum() * window_sec / 3600.0)
     return eps, stats
 
 
@@ -184,6 +154,29 @@ def wilson(k, n, z=1.96):
     h = z * np.sqrt(p * (1 - p) / n + z * z / (4 * n * n))
     return (c - h) / d, (c + h) / d
 
+
+
+def sanity_check(df, window_sec, horizon, res_name):
+    """Refuse to run if the file is not really at this resolution or the label horizon is off."""
+    bad = []
+    for scen, g in df.groupby("scenario", sort=False):
+        step = g["StartTime"].diff().dropna().dt.total_seconds()
+        if not (step == window_sec).all():
+            bad.append(f"{scen}: window step(s) {sorted(step.unique())[:3]} != {window_sec}s")
+    if bad:
+        raise ValueError(f"[{res_name}] file is not on a {window_sec}s grid, so it was not windowed at this "
+                         "resolution:\n  " + "\n  ".join(bad))
+    eps = df[df["episode_id"] >= 0].groupby("scenario")["episode_id"].nunique()
+    print(f"  episodes per scenario: {eps.to_dict()}")
+    if (eps != 3).any():
+        print("  WARNING: expected 3 episodes per scenario; check max_gap / merged attack runs")
+    n_pos = int(((df["quiet"] == 1) & (df[TARGET] == 1)).sum())
+    n_pre = int(((df["quiet"] == 1) & (df["is_pre_episode_window"] == 1)).sum())
+    print(f"  rows {len(df):,} | quiet {int(df['quiet'].sum()):,} | quiet positives {n_pos} | "
+          f"pre-onset windows {n_pre}")
+    if n_pos != n_pre:
+        raise ValueError(f"[{res_name}] label look-ahead does not match horizon={horizon} windows; "
+                         "rebuild the windowed file with windows.py at this resolution")
 
 # --------------------------------------------------------------------------------------
 # Models
@@ -200,8 +193,6 @@ def fit_model(X, y):
 
 
 def inner_oof(df, scens, feats):
-    """LOSO scores restricted to `scens`: each scenario scored by a model trained on the
-    other scenarios of `scens` (quiet rows only). Returns an array aligned to df rows."""
     out = np.zeros(len(df))
     scen_arr = df["scenario"].to_numpy()
     for k in scens:
@@ -216,7 +207,7 @@ def inner_oof(df, scens, feats):
 # --------------------------------------------------------------------------------------
 # Nested LOSO
 # --------------------------------------------------------------------------------------
-def run_nested_loso(df, feats, target_fa):
+def run_nested_loso(df, feats, target_fa, window_sec):
     scenarios = sorted(df["scenario"].unique())
     scen_arr = df["scenario"].to_numpy()
     quiet = df["quiet"].to_numpy()
@@ -235,8 +226,8 @@ def run_nested_loso(df, feats, target_fa):
 
         inner = inner_oof(df, others, feats)
         m_o = np.isin(scen_arr, others)
-        thr_x[s] = choose_threshold(inner[m_o], quiet[m_o], y[m_o], scen_arr[m_o], target_fa)
-        thr_b[s] = choose_threshold(base_score[m_o], quiet[m_o], y[m_o], scen_arr[m_o], target_fa)
+        thr_x[s] = choose_threshold(inner[m_o], quiet[m_o], y[m_o], scen_arr[m_o], target_fa, window_sec)
+        thr_b[s] = choose_threshold(base_score[m_o], quiet[m_o], y[m_o], scen_arr[m_o], target_fa, window_sec)
     return scenarios, xgb_score, base_score, thr_x, thr_b
 
 
@@ -251,185 +242,135 @@ def summarize(name, eps_all, stats_all):
     print(f"{name:14s} | warned {k:2d}/{n:2d} ({100 * k / max(1, n):4.1f}%, 95% CI "
           f"{100 * lo:.0f}-{100 * hi:.0f}%) | mean lead {np.mean(leads) if leads else 0:5.1f}s | "
           f"false alert events/hr {fe / hours:5.2f} | false alert windows/hr {fw / hours:5.2f}")
-    for ph in sorted({e["phase"] for e in eps_all}):
-        sub = [e for e in eps_all if e["phase"] == ph]
-        kk = sum(e["detected"] for e in sub)
-        print(f"{'':14s}   {PHASE_LABELS.get(ph, f'phase {ph + 1}')}: {kk}/{len(sub)}")
 
 
-def report_nested(df, scenarios, xgb_score, base_score, thr_x, thr_b, target_fa):
+def report_nested(df, scenarios, xgb_score, base_score, thr_x, thr_b, target_fa, res_name, window_sec, horizon):
     q = df["quiet"].to_numpy() == 1
     y = df[TARGET].to_numpy()
     scen_arr = df["scenario"].to_numpy()
 
-    print(f"\n{'Scenario':22s} | {'ROC':>6s} | {'PR':>6s} | {'bROC':>6s} | {'bPR':>6s} | "
-          f"{'thr(xgb)':>8s} | {'thr(rule)':>9s}")
-    print("-" * 86)
-    for s in scenarios:
-        m = (scen_arr == s) & q
-        print(f"{s:22s} | {roc_auc_score(y[m], xgb_score[m]):6.4f} | "
-              f"{average_precision_score(y[m], xgb_score[m]):6.4f} | "
-              f"{roc_auc_score(y[m], base_score[m]):6.4f} | "
-              f"{average_precision_score(y[m], base_score[m]):6.4f} | "
-              f"{thr_x[s]:8.4f} | {thr_b[s]:9.4f}")
-    print(f"{'pooled':22s} | {roc_auc_score(y[q], xgb_score[q]):6.4f} | "
-          f"{average_precision_score(y[q], xgb_score[q]):6.4f} | "
-          f"{roc_auc_score(y[q], base_score[q]):6.4f} | "
-          f"{average_precision_score(y[q], base_score[q]):6.4f} |")
-
     results = {"xgboost": ([], []), "rule baseline": ([], [])}
     rows = []
+    stat_rows = []
     for s in scenarios:
         g = df[df["scenario"] == s]
         m = (scen_arr == s)
         for name, sc, th in (("xgboost", xgb_score, thr_x[s]),
                              ("rule baseline", base_score, thr_b[s])):
-            eps, st = evaluate_scenario(g, sc[m], th)
+            eps, st = evaluate_scenario(g, sc[m], th, window_sec, horizon)
             results[name][0].extend(eps)
             results[name][1].append(st)
             rows.extend({**e, "method": name} for e in eps)
+            stat_rows.append({**st, "method": name, "threshold": th})
 
-    print("\n" + "=" * 86)
-    print(f"NESTED LOSO EPISODE SUMMARY  (threshold per fold chosen on the other scenarios, "
-          f"budget <= {target_fa:.1f} false alert events/hr)")
-    print("=" * 86)
+    print(f"\nNESTED LOSO EPISODE SUMMARY [{res_name}]")
     for name, (eps, st) in results.items():
         summarize(name, eps, st)
 
-    os.makedirs("reports", exist_ok=True)
-    pd.DataFrame(rows).to_csv("reports/episode_results.csv", index=False)
-    print("\nPer-episode results -> reports/episode_results.csv")
-
-
-# --------------------------------------------------------------------------------------
-# Ablation
-# --------------------------------------------------------------------------------------
-def run_ablation(df, feats):
-    variants = {
-        "full": feats,
-        "no_response": [c for c in feats if not c.startswith(RESPONSE_PREFIXES)],
-        "no_scale": [c for c in feats if not c.startswith(SCALE_PREFIXES)],
-        "no_response_no_scale": [c for c in feats if not c.startswith(RESPONSE_PREFIXES + SCALE_PREFIXES)],
-    }
-    scenarios = sorted(df["scenario"].unique())
-    scen_arr = df["scenario"].to_numpy()
-    q = df["quiet"].to_numpy() == 1
-    y = df[TARGET].to_numpy()
-    print("\n" + "=" * 86)
-    print("FEATURE ABLATION (plain LOSO, quiet rows)   PR-AUC per held-out scenario")
-    print("=" * 86)
-    header = f"{'variant':22s} | {'#feat':>5s} | " + " ".join(f"{s.split('-')[1]:>5s}" for s in scenarios) + " | pooled PR | pooled ROC"
-    print(header)
-    for name, fs in variants.items():
-        print(f"  running {name} ({len(fs)} features) ...", flush=True)
-        sc = inner_oof(df, scenarios, fs)
-        prs = [average_precision_score(y[(scen_arr == s) & q], sc[(scen_arr == s) & q]) for s in scenarios]
-        print(f"{name:22s} | {len(fs):5d} | " + " ".join(f"{p:5.2f}" for p in prs) +
-              f" | {average_precision_score(y[q], sc[q]):9.4f} | {roc_auc_score(y[q], sc[q]):10.4f}")
+    out_dir = os.path.join("reports", res_name)
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, "episode_results.csv")
+    pd.DataFrame(rows).to_csv(out_path, index=False)
+    fa_path = os.path.join(out_dir, "fa_summary.csv")
+    pd.DataFrame(stat_rows).to_csv(fa_path, index=False)
+    print(f"Per-episode results -> {out_path}\nFalse-alert summary -> {fa_path}")
 
 
 # --------------------------------------------------------------------------------------
 # Dashboard demo
 # --------------------------------------------------------------------------------------
-def build_demo(df, feats, holdouts, target_fa):
+def build_demo(df, feats, holdouts, target_fa, res_name, window_sec, horizon):
     scenarios = sorted(df["scenario"].unique())
     train_scens = [s for s in scenarios if s not in holdouts]
     scen_arr = df["scenario"].to_numpy()
     quiet = df["quiet"].to_numpy()
     y = df[TARGET].to_numpy()
-    print(f"\nDemo model: train on {len(train_scens)} scenarios, hold out {holdouts}", flush=True)
+    print(f"\n[{res_name}] Demo model: train on {len(train_scens)} scenarios, hold out {holdouts}")
 
     inner = inner_oof(df, train_scens, feats)
     m_tr = np.isin(scen_arr, train_scens)
-    thr = choose_threshold(inner[m_tr], quiet[m_tr], y[m_tr], scen_arr[m_tr], target_fa)
+    thr = choose_threshold(inner[m_tr], quiet[m_tr], y[m_tr], scen_arr[m_tr], target_fa, window_sec)
     base_thr = choose_threshold(df[BASELINE_COL].to_numpy(float)[m_tr], quiet[m_tr], y[m_tr],
-                                scen_arr[m_tr], target_fa)
+                                scen_arr[m_tr], target_fa, window_sec)
 
     tr = df[df["scenario"].isin(train_scens) & (df["quiet"] == 1)]
     model = fit_model(tr[feats], tr[TARGET])
 
-    imp = pd.Series(model.feature_importances_, index=feats).sort_values(ascending=False)
-    print("Top 12 features (check for lab fingerprints):")
-    for f, v in imp.head(12).items():
-        print(f"  {f:32s}: {v:.4f}")
-
-    os.makedirs("models", exist_ok=True)
-    joblib.dump(model, "models/xgb_pingahead.pkl")
-    with open("models/model_config.json", "w") as f:
+    model_dir = os.path.join("models", res_name)
+    os.makedirs(model_dir, exist_ok=True)
+    joblib.dump(model, os.path.join(model_dir, "xgb_pingahead.pkl"))
+    with open(os.path.join(model_dir, "model_config.json"), "w") as f:
         json.dump({
             "feature_cols": feats,
             "threshold": thr,
             "rule_baseline_threshold": base_thr,
             "target_false_alert_events_per_hr": target_fa,
+            "resolution": res_name,
+            "window_sec": window_sec,
+            "horizon_steps": horizon,
             "threshold_source": "inner LOSO on training scenarios only",
             "holdout_scenarios": holdouts,
-            "scores_are_probabilities": False,
-            "note": "Model is trained on quiet rows only; scores inside attacks are not meaningful.",
         }, f, indent=2)
 
-    sim_dir = "data/processed/03_simulation"
+    sim_dir = os.path.join("data", "processed", "03_simulation", res_name)
     os.makedirs(sim_dir, exist_ok=True)
-    print(f"\nDemo threshold = {thr:.4f}")
     for h in holdouts:
         g = df[df["scenario"] == h].copy().reset_index(drop=True)
         g["pred_prob"] = model.predict_proba(g[feats])[:, 1]
-        # SIMULATION ONLY: in_episode / post_episode come from labels. A live system would not
-        # know them. They let the dashboard show ground truth and hide forecasts during attacks.
         g["forecast_valid"] = ((g["in_episode"] == 0) & (g["post_episode"] == 0)).astype(int)
         g["forecast_alert"] = ((g["pred_prob"] >= thr) & (g["forecast_valid"] == 1)).astype(int)
         g["ui_state"] = np.select(
             [g["in_episode"] == 1, g["post_episode"] == 1, g["forecast_alert"] == 1],
             ["ATTACK", "RECOVERING", "WARNING"], default="NORMAL")
-        eps, st = evaluate_scenario(g, g["pred_prob"].to_numpy(), thr)
-        warned = sum(e["detected"] for e in eps)
-        print(f"  {h}: episodes warned {warned}/{len(eps)} | false alert events {st['false_events']} "
-              f"over {st['hours']:.1f} quiet h | alert windows shown: {int(g['forecast_alert'].sum())}")
         out = os.path.join(sim_dir, f"sim_{h}.csv")
         g.to_csv(out, index=False)
-        print(f"    saved {out} ({len(g)} rows)")
+        print(f"  saved simulation -> {out}")
 
 
 # --------------------------------------------------------------------------------------
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data", default="data/processed/02_windowed/all_scenarios_windowed.csv")
-    ap.add_argument("--target-fa", type=float, default=2.0, help="false alert events per hour")
+    ap.add_argument("--target-fa", type=float, default=2.0)
     ap.add_argument("--holdout", nargs="+", default=["scenario-5-disrupt", "scenario-8-authtest"])
-    ap.add_argument("--ablate", action="store_true")
+    ap.add_argument("--res", nargs="+", default=None, help="subset of resolutions, e.g. --res 10s")
     args = ap.parse_args()
 
-    if not os.path.exists(args.data):
-        raise FileNotFoundError(f"Missing {args.data}. Run python3 src/windows.py first.")
-    df = pd.read_csv(args.data)
-    df["StartTime"] = pd.to_datetime(df["StartTime"])
-    df = df.sort_values(["scenario", "StartTime"], kind="stable").reset_index(drop=True)
-    df = build_masks(df)
+    resolutions = [
+        ("5s", 5, "data/processed/02_windowed/5s/all_scenarios_windowed.csv"),
+        ("10s", 10, "data/processed/02_windowed/10s/all_scenarios_windowed.csv"),
+        ("30s", 30, "data/processed/02_windowed/30s/all_scenarios_windowed.csv"),
+        ("60s", 60, "data/processed/02_windowed/60s/all_scenarios_windowed.csv"),
+    ]
 
-    feats = [c for c in df.columns if c not in META_AND_LABEL_COLS]
-    present = [c for c in FORBIDDEN_COLS if c in df.columns]
-    if present:
-        print(f"Note: excluded label-derived columns from features: {present}")
-    assert not set(feats) & set(META_AND_LABEL_COLS)
-    assert BASELINE_COL in feats
+    for res_name, window_sec, data_path in resolutions:
+        if args.res and res_name not in args.res:
+            continue
+        if not os.path.exists(data_path):
+            print(f"Skipping {res_name}: {data_path} not found.")
+            continue
 
-    q = df["quiet"] == 1
-    n_pos = int(((df["quiet"] == 1) & (df[TARGET] == 1)).sum())
-    n_pre = int(((df["quiet"] == 1) & (df["is_pre_episode_window"] == 1)).sum())
-    print(f"{len(df):,} rows | {int(q.sum()):,} quiet rows ({q.sum() * WINDOW_SEC / 3600:.1f} h) | "
-          f"{int(df['in_episode'].sum()):,} in-episode | {int(df['post_episode'].sum())} post-episode | "
-          f"{int(df['tail_row'].sum())} tail | {df['episode_id'].max() + 1} episodes | "
-          f"{n_pos} quiet positives ({n_pre} flagged pre-onset) | {len(feats)} features")
-    if n_pos != n_pre:
-        print("WARNING: quiet positives != pre-onset windows; check label/episode definitions.")
+        # Dynamically scale horizon, max gap, and post windows based on physical time (60s target)
+        horizon = max(1, TARGET_LEAD_SEC // window_sec)
+        max_gap = max(1, MAX_GAP_SEC // window_sec)
+        post_windows = max(1, POST_SEC // window_sec)
 
-    print("\nNested leave-one-scenario-out evaluation (this fits ~64 small models) ...")
-    scenarios, xs, bs, tx, tb = run_nested_loso(df, feats, args.target_fa)
-    report_nested(df, scenarios, xs, bs, tx, tb, args.target_fa)
+        print("\n" + "#" * 86)
+        print(f"PROCESSING RESOLUTION: {res_name} ({window_sec}s windows) | Horizon: {horizon} steps ({horizon * window_sec}s lead time)")
+        print("#" * 86)
 
-    if args.ablate:
-        run_ablation(df, feats)
+        df = pd.read_csv(data_path)
+        df["StartTime"] = pd.to_datetime(df["StartTime"])
+        df = df.sort_values(["scenario", "StartTime"], kind="stable").reset_index(drop=True)
+        df = build_masks(df, horizon=horizon, max_gap=max_gap, post=post_windows)
 
-    build_demo(df, feats, args.holdout, args.target_fa)
+        sanity_check(df, window_sec, horizon, res_name)
+
+        feats = [c for c in df.columns if c not in META_AND_LABEL_COLS]
+        assert BASELINE_COL in feats
+
+        scenarios, xs, bs, tx, tb = run_nested_loso(df, feats, args.target_fa, window_sec)
+        report_nested(df, scenarios, xs, bs, tx, tb, args.target_fa, res_name, window_sec, horizon)
+        build_demo(df, feats, args.holdout, args.target_fa, res_name, window_sec, horizon)
 
 
 if __name__ == "__main__":

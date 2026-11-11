@@ -1,0 +1,17 @@
+scenario,false_events,true_events,false_windows,hours,method,threshold
+scenario-1-disrupt,13,3,21,7.841666666666667,xgboost,0.23185509741421315
+scenario-1-disrupt,17,2,24,7.841666666666667,rule baseline,0.125
+scenario-2-disrupt,11,3,22,3.466666666666667,xgboost,0.23757213752135528
+scenario-2-disrupt,5,2,11,3.466666666666667,rule baseline,0.1257575757575758
+scenario-3-disrupt,13,2,23,7.875,xgboost,0.20338650960703009
+scenario-3-disrupt,14,0,18,7.875,rule baseline,0.12575757575757576
+scenario-4-disrupt,17,3,21,7.875,xgboost,0.22951362302926698
+scenario-4-disrupt,17,2,26,7.875,rule baseline,0.125
+scenario-5-disrupt,14,3,65,8.858333333333333,xgboost,0.23387864279100337
+scenario-5-disrupt,11,3,63,8.858333333333333,rule baseline,0.12634581417314925
+scenario-6-authtest,21,2,36,7.85,xgboost,0.20662192980057767
+scenario-6-authtest,17,0,25,7.85,rule baseline,0.125
+scenario-7-authtest,17,3,30,6.3,xgboost,0.23948662338329962
+scenario-7-authtest,15,2,33,6.3,rule baseline,0.12446657407045045
+scenario-8-authtest,20,3,33,7.216666666666667,xgboost,0.19874360161327023
+scenario-8-authtest,17,2,25,7.216666666666667,rule baseline,0.12464537012189424

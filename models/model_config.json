@@ -129,8 +129,8 @@
     "unique_dst_roll6_mean",
     "unique_dst_roll6_std"
   ],
-  "threshold": 0.6196302947411971,
-  "rule_baseline_threshold": 0.14351851851851857,
+  "threshold": 0.683873906053759,
+  "rule_baseline_threshold": 0.11773471246799187,
   "target_false_alert_events_per_hr": 2.0,
   "threshold_source": "inner LOSO on training scenarios only",
   "holdout_scenarios": [

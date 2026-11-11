@@ -1,0 +1,49 @@
+scenario,episode_id,phase,detected,lead_sec,threshold,method
+scenario-1-disrupt,0,0,1,0.0,0.09926029682702321,xgboost
+scenario-1-disrupt,1,1,1,0.0,0.09926029682702321,xgboost
+scenario-1-disrupt,2,2,1,0.0,0.09926029682702321,xgboost
+scenario-1-disrupt,0,0,0,,0.09920634920634924,rule baseline
+scenario-1-disrupt,1,1,1,0.0,0.09920634920634924,rule baseline
+scenario-1-disrupt,2,2,1,0.0,0.09920634920634924,rule baseline
+scenario-2-disrupt,3,0,1,0.0,0.09443941253467608,xgboost
+scenario-2-disrupt,4,1,1,0.0,0.09443941253467608,xgboost
+scenario-2-disrupt,5,2,1,0.0,0.09443941253467608,xgboost
+scenario-2-disrupt,3,0,1,0.0,0.09999999999999999,rule baseline
+scenario-2-disrupt,4,1,1,0.0,0.09999999999999999,rule baseline
+scenario-2-disrupt,5,2,0,,0.09999999999999999,rule baseline
+scenario-3-disrupt,6,0,0,,0.07904813964475331,xgboost
+scenario-3-disrupt,7,1,0,,0.07904813964475331,xgboost
+scenario-3-disrupt,8,2,1,0.0,0.07904813964475331,xgboost
+scenario-3-disrupt,6,0,0,,0.09920634920634921,rule baseline
+scenario-3-disrupt,7,1,0,,0.09920634920634921,rule baseline
+scenario-3-disrupt,8,2,1,0.0,0.09920634920634921,rule baseline
+scenario-4-disrupt,9,0,1,0.0,0.0928679531028464,xgboost
+scenario-4-disrupt,10,1,1,0.0,0.0928679531028464,xgboost
+scenario-4-disrupt,11,2,1,0.0,0.0928679531028464,xgboost
+scenario-4-disrupt,9,0,0,,0.09991891607163605,rule baseline
+scenario-4-disrupt,10,1,1,0.0,0.09991891607163605,rule baseline
+scenario-4-disrupt,11,2,1,0.0,0.09991891607163605,rule baseline
+scenario-5-disrupt,12,0,1,0.0,0.08461364443741211,xgboost
+scenario-5-disrupt,13,1,1,0.0,0.08461364443741211,xgboost
+scenario-5-disrupt,14,2,1,0.0,0.08461364443741211,xgboost
+scenario-5-disrupt,12,0,1,0.0,0.10574674739997049,rule baseline
+scenario-5-disrupt,13,1,1,0.0,0.10574674739997049,rule baseline
+scenario-5-disrupt,14,2,1,0.0,0.10574674739997049,rule baseline
+scenario-6-authtest,15,0,0,,0.08131456846556137,xgboost
+scenario-6-authtest,16,1,1,0.0,0.08131456846556137,xgboost
+scenario-6-authtest,17,2,1,0.0,0.08131456846556137,xgboost
+scenario-6-authtest,15,0,0,,0.10192452291251293,rule baseline
+scenario-6-authtest,16,1,0,,0.10192452291251293,rule baseline
+scenario-6-authtest,17,2,0,,0.10192452291251293,rule baseline
+scenario-7-authtest,18,0,1,0.0,0.09634987087195127,xgboost
+scenario-7-authtest,19,1,1,0.0,0.09634987087195127,xgboost
+scenario-7-authtest,20,2,1,0.0,0.09634987087195127,xgboost
+scenario-7-authtest,18,0,1,0.0,0.0992063492063492,rule baseline
+scenario-7-authtest,19,1,1,0.0,0.0992063492063492,rule baseline
+scenario-7-authtest,20,2,0,,0.0992063492063492,rule baseline
+scenario-8-authtest,21,0,1,0.0,0.07642009606637487,xgboost
+scenario-8-authtest,22,1,1,0.0,0.07642009606637487,xgboost
+scenario-8-authtest,23,2,0,,0.07642009606637487,xgboost
+scenario-8-authtest,21,0,0,,0.09830969883765268,rule baseline
+scenario-8-authtest,22,1,1,0.0,0.09830969883765268,rule baseline
+scenario-8-authtest,23,2,1,0.0,0.09830969883765268,rule baseline
